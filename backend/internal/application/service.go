@@ -50,6 +50,10 @@ var ErrApplicationReviewConflict = errors.New("application was already reviewed 
 // configuration, or submits data that fails the task's view form schema.
 var ErrInvalidInjectRequest = errors.New("invalid inject request")
 
+// ErrInvalidReviewRequest is returned when a review submission's reviewer
+// response data fails the task's review form schema.
+var ErrInvalidReviewRequest = errors.New("invalid review request")
+
 // Service handles Agency portal operations
 type Service interface {
 	// CreateApplication creates a new application from injected data
@@ -194,7 +198,7 @@ func (s *service) CreateApplication(ctx context.Context, req *InjectRequest) err
 	}
 
 	if config.Forms.View != "" {
-		if err := validateAgainstViewForm(ctx, s.artifactRegistry, config.Forms.View, req.Data); err != nil {
+		if err := validateAgainstFormSchema(ctx, s.artifactRegistry, "view", config.Forms.View, req.Data, ErrInvalidInjectRequest); err != nil {
 			return err
 		}
 	}
@@ -506,6 +510,33 @@ func (s *service) ReviewApplication(ctx context.Context, taskID string, reviewer
 		// arbitrary reviewer-supplied field as the command and status.
 		return fmt.Errorf("failed to load task config for task %s: %w", app.TaskCode, configErr)
 	}
+
+	// The reference ID at config.RefID.Path was minted once at inject time
+	// and echoed back to the client as part of AgencyActionData, so a review
+	// submission naturally round-trips it — but it must never be trusted as
+	// reviewer input. Overwrite whatever the client sent at that path with
+	// the value already on record, so a tampered or stale client-supplied ID
+	// can't get persisted as this application's reference ID.
+	if config.RefID != nil {
+		id, ok := jsonpointer.Get(record.ReviewerResponse, config.RefID.Path)
+		if !ok {
+			// This should never happen: the inject path always writes a reference ID at that path, and the record is immutable after inject. If it does
+			// happen, it's a data integrity problem that must be fixed
+			// before any review can be accepted. Added this so it doesn't silently drop the reference ID and let a tampered client-supplied value get persisted instead.
+			return fmt.Errorf("application %s has no reference ID at %q despite task %s declaring a refid block", taskID, config.RefID.Path, app.TaskCode)
+		}
+		if reviewerResponse == nil {
+			reviewerResponse = map[string]any{}
+		}
+		if !jsonpointer.Set(reviewerResponse, config.RefID.Path, id) {
+			return fmt.Errorf("failed to write reference ID to %q", config.RefID.Path)
+		}
+	}
+
+	if err := validateAgainstFormSchema(ctx, s.artifactRegistry, "review", config.Forms.Review, reviewerResponse, ErrInvalidReviewRequest); err != nil {
+		return err
+	}
+
 	behavior := config.Behavior
 
 	command := "approve"

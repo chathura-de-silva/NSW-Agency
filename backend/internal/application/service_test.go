@@ -505,6 +505,7 @@ func TestReviewApplication_StatusFromStatusMap(t *testing.T) {
 				}
 			}
 		}`)
+		writeFormFile(t, root, "alpha_review.json", `{"schema": {}}`)
 	})
 	h.seed("t-approve", "alpha", nil)
 	h.seed("t-reject", "alpha", nil)
@@ -544,6 +545,7 @@ func TestReviewApplication_AutoApprove(t *testing.T) {
 			"forms": {"review": "sample_wait_review"},
 			"behavior": {"type": "autoApprove"}
 		}`)
+		writeFormFile(t, root, "sample_wait_review.json", `{"schema": {}}`)
 	})
 	h.seed("t-auto", "sample_wait", nil)
 
@@ -657,6 +659,7 @@ func TestReviewApplication_DefaultsToDONE_OutcomeNotInMap(t *testing.T) {
 			"forms": {"review": "alpha_review"},
 			"behavior": {"type": "statusMap", "statusMap": {"approve": "APPROVED"}}
 		}`)
+		writeFormFile(t, root, "alpha_review.json", `{"schema": {}}`)
 	})
 	h.seed("t-unknown", "alpha", nil)
 
@@ -683,6 +686,7 @@ func TestReviewApplication_DefaultsToDONE_NoStatusMap(t *testing.T) {
 			"forms": {"review": "alpha_review"},
 			"behavior": {"type": "statusMap"}
 		}`)
+		writeFormFile(t, root, "alpha_review.json", `{"schema": {}}`)
 	})
 	h.seed("t-no-map", "alpha", nil)
 
@@ -722,6 +726,131 @@ func TestReviewApplication_NoConfig_FailsClosed(t *testing.T) {
 	}
 }
 
+// ---------- ReviewApplication: review form schema validation ----------
+
+func TestReviewApplication_ValidatesAgainstReviewFormSchema(t *testing.T) {
+	h := newServiceHarness(t, func(root string) {
+		writeTaskConfigFile(t, root, "alpha.json", `{
+			"schemaVersion": 1,
+			"meta": {"title": "Alpha"},
+			"permissions": [{"role": "officer", "actions": ["VIEW", "REVIEW", "FEEDBACK"]}],
+			"forms": {"review": "alpha_review"},
+			"behavior": {"type": "statusMap", "statusMap": {"approve": "APPROVED"}}
+		}`)
+		writeFormFile(t, root, "alpha_review.json", `{
+			"schema": {
+				"type": "object",
+				"required": ["review_outcome"],
+				"properties": {"review_outcome": {"type": "string", "minLength": 1}}
+			}
+		}`)
+	})
+
+	t.Run("data missing a required field is rejected", func(t *testing.T) {
+		h.seed("t-review-bad", "alpha", nil)
+		ctx := h.claimAs("t-review-bad", "officer-1")
+		err := h.service.ReviewApplication(ctx, "t-review-bad", map[string]any{
+			"comment": "no outcome field here",
+		})
+		if !errors.Is(err, ErrInvalidReviewRequest) {
+			t.Fatalf("expected ErrInvalidReviewRequest, got %v", err)
+		}
+		if got := h.statusOf("t-review-bad"); got != "PENDING" {
+			t.Errorf("status: got %q, want PENDING (review must not finalize on schema mismatch)", got)
+		}
+		if body := h.capture.lastCall(); body != nil {
+			t.Errorf("expected no callback to be sent when the reviewer response fails schema validation, got %v", body)
+		}
+	})
+
+	t.Run("data satisfying the schema is accepted", func(t *testing.T) {
+		h.seed("t-review-good", "alpha", nil)
+		ctx := h.claimAs("t-review-good", "officer-1")
+		err := h.service.ReviewApplication(ctx, "t-review-good", map[string]any{
+			"review_outcome": "approve",
+		})
+		if err != nil {
+			t.Fatalf("ReviewApplication failed: %v", err)
+		}
+		if got := h.statusOf("t-review-good"); got != "APPROVED" {
+			t.Errorf("status: got %q, want APPROVED", got)
+		}
+	})
+}
+
+func TestReviewApplication_ReviewFormLoadFailure_FailsClosed(t *testing.T) {
+	h := newServiceHarness(t, func(root string) {
+		writeTaskConfigFile(t, root, "alpha.json", `{
+			"schemaVersion": 1,
+			"meta": {"title": "Alpha"},
+			"permissions": [{"role": "officer", "actions": ["VIEW", "REVIEW", "FEEDBACK"]}],
+			"forms": {"review": "does_not_exist"},
+			"behavior": {"type": "statusMap", "statusMap": {"approve": "APPROVED"}}
+		}`)
+	})
+	h.seed("t-review-missing-form", "alpha", nil)
+
+	ctx := h.claimAs("t-review-missing-form", "officer-1")
+	err := h.service.ReviewApplication(ctx, "t-review-missing-form", map[string]any{
+		"review_outcome": "approve",
+	})
+	if err == nil {
+		t.Fatal("expected ReviewApplication to fail closed when the review form can't be loaded")
+	}
+	if errors.Is(err, ErrInvalidReviewRequest) {
+		t.Errorf("expected a config-drift error, not ErrInvalidReviewRequest: %v", err)
+	}
+	if got := h.statusOf("t-review-missing-form"); got != "PENDING" {
+		t.Errorf("status: got %q, want PENDING", got)
+	}
+}
+
+// ---------- ReviewApplication: reference ID cannot be client-supplied ----------
+
+// TestReviewApplication_RefID_ClientCannotOverride guards against a reviewer
+// submission overriding the reference ID minted at inject time.
+// AgencyActionData echoes that ID back to the client so it round-trips
+// through the review form, but a client-supplied value at that path must
+// never reach the record, the NSW callback, or review form validation.
+func TestReviewApplication_RefID_ClientCannotOverride(t *testing.T) {
+	stub := &stubRefIDRegistry{id: "NPQS/NPQS-KAT/000042"}
+	h := newServiceHarnessWithRefIDs(t, stub, func(root string) {
+		writeTaskConfigFile(t, root, "refid_task.json", refIDTaskConfig)
+		writeFormFile(t, root, "refid_review.json", `{"schema": {}}`)
+	})
+
+	if err := h.service.CreateApplication(context.Background(), &InjectRequest{
+		TaskID:        "t-refid-review",
+		TaskCode:      "refid_task",
+		ConsignmentID: "c-refid-review",
+		Data:          map[string]any{"nppo_office_location": "NPQS-KAT"},
+	}); err != nil {
+		t.Fatalf("CreateApplication: %v", err)
+	}
+
+	ctx := h.claimAs("t-refid-review", "officer-1")
+	if err := h.service.ReviewApplication(ctx, "t-refid-review", map[string]any{
+		"review_outcome":   "approve",
+		"reference_number": "SPOOFED/000000",
+	}); err != nil {
+		t.Fatalf("ReviewApplication: %v", err)
+	}
+
+	rec, err := h.store.GetByTaskID("t-refid-review")
+	if err != nil {
+		t.Fatalf("GetByTaskID: %v", err)
+	}
+	if got := rec.ReviewerResponse["reference_number"]; got != "NPQS/NPQS-KAT/000042" {
+		t.Fatalf("reference_number = %v after review, want the originally minted ID (client-supplied value must be ignored)", got)
+	}
+
+	body := h.capture.lastCall()
+	payload, _ := body["payload"].(map[string]any)
+	if got := payload["reference_number"]; got != "NPQS/NPQS-KAT/000042" {
+		t.Fatalf("callback payload reference_number = %v, want the originally minted ID, not the client-supplied one", got)
+	}
+}
+
 // ---------- ReviewApplication: outcomeField override ----------
 
 func TestReviewApplication_OutcomeFieldOverride(t *testing.T) {
@@ -737,6 +866,7 @@ func TestReviewApplication_OutcomeFieldOverride(t *testing.T) {
 				"statusMap": {"pass": "APPROVED", "fail": "REJECTED"}
 			}
 		}`)
+		writeFormFile(t, root, "labs_review.json", `{"schema": {}}`)
 	})
 
 	t.Run("custom field hit", func(t *testing.T) {
@@ -781,6 +911,7 @@ func TestReviewApplication_SendsCallback(t *testing.T) {
 			"forms": {"review": "alpha_review"},
 			"behavior": {"type": "statusMap", "statusMap": {"approve": "APPROVED"}}
 		}`)
+		writeFormFile(t, root, "alpha_review.json", `{"schema": {}}`)
 	})
 	h.seed("t-callback", "alpha", nil)
 
@@ -1516,6 +1647,7 @@ func TestReviewApplication_ConflictOnDoubleSubmit(t *testing.T) {
 			"forms": {"review": "alpha_review"},
 			"behavior": {"type": "statusMap"}
 		}`)
+		writeFormFile(t, root, "alpha_review.json", `{"schema": {}}`)
 	})
 	h.seed("t-review-double", "alpha", nil)
 
@@ -1545,6 +1677,7 @@ func TestReleaseApplication_RejectedOnceReviewed(t *testing.T) {
 			"forms": {"review": "alpha_review"},
 			"behavior": {"type": "statusMap"}
 		}`)
+		writeFormFile(t, root, "alpha_review.json", `{"schema": {}}`)
 	})
 	h.seed("t-release-reviewed", "alpha", nil)
 

@@ -193,6 +193,8 @@ func (h *Handler) HandleReviewApplication(w http.ResponseWriter, r *http.Request
 			httputil.Error(w, r, http.StatusForbidden, "You must claim this application before reviewing it")
 		case errors.Is(err, ErrApplicationReviewConflict):
 			httputil.Error(w, r, http.StatusConflict, "This application was already reviewed or your claim has changed; please refresh and try again")
+		case errors.Is(err, ErrInvalidReviewRequest):
+			httputil.Error(w, r, http.StatusBadRequest, err.Error())
 		default:
 			httputil.InternalServerError(w, r, "failed to review application", err, "taskID", taskID)
 		}
