@@ -107,3 +107,22 @@ field:
   ever runs on a schema that already passed `ValidateInstance`, that schema's patterns were
   already compiled successfully during `ValidateInstance`'s resolve step.
 - A malformed (unparsable) `rawSchema` returns an error wrapped in `ErrSchemaLoad`.
+
+### Complexity limit
+
+Every property schema that applies to a key is recursed into separately - `properties`, every
+matching `patternProperties` entry, and a `$ref`'s own keywords plus its resolved target's all
+apply together (see [Property matching precedence](#property-matching-precedence) and
+[$ref resolution](#ref-resolution)). If a schema lets more than one of those apply to the same key
+and is itself self-referential (a recursive `$ref`), that multiplicity compounds at every level of
+a deeply nested instance: e.g. two `patternProperties` entries both matching a repeated key name,
+recursing into a `$ref` back to the same definition, turns a ~40-level deep instance (well within
+`encoding/json`'s own 10000-level nesting limit) into over a trillion `stripValue` calls.
+
+The schema is trusted (it comes from the form definition, not the client), but the instance isn't,
+and nothing about a valid, sensible-looking recursive schema rules this multiplicity out — so the
+walk itself is capped rather than relying on schema review: `StripReadOnly` bails out once it
+exceeds 100,000 schema-application steps, returning `nil` wrapped in `ErrTooComplex` instead of a
+partially-stripped map.
+
+

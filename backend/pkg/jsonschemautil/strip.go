@@ -4,6 +4,7 @@ package jsonschemautil
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"regexp"
@@ -12,6 +13,18 @@ import (
 
 	"github.com/google/jsonschema-go/jsonschema"
 )
+
+// ErrTooComplex is returned when an instance requires more schema-application
+// steps than maxStripSteps to strip. See docs/jsonschemautil.md ("Complexity limit").
+var ErrTooComplex = errors.New("jsonschemautil: instance too complex to strip safely")
+
+// maxStripSteps bounds the number of stripValue calls in a single
+// StripReadOnly call.
+const maxStripSteps = 100_000
+
+// errStepBudgetExceeded unwinds the walk via panic/recover once maxStripSteps
+// is exceeded.
+var errStepBudgetExceeded = errors.New("jsonschemautil: step budget exceeded")
 
 // patternCache memoizes regexp.Compile results for a single StripReadOnly
 // call, keyed by the pattern string. A cached nil marks a pattern that
@@ -32,6 +45,20 @@ func (c patternCache) compile(pattern string) *regexp.Regexp {
 	return re
 }
 
+// stripWalker holds the state threaded through a single StripReadOnly call.
+type stripWalker struct {
+	root      *jsonschema.Schema
+	cache     patternCache
+	remaining int
+}
+
+func (w *stripWalker) step() {
+	if w.remaining <= 0 {
+		panic(errStepBudgetExceeded)
+	}
+	w.remaining--
+}
+
 // StripReadOnly parses rawSchema as a JSON Schema and deletes every field
 // marked "readOnly": true from instance. See docs/jsonschemautil.md for the
 // supported subset of JSON Schema.
@@ -42,7 +69,10 @@ func (c patternCache) compile(pattern string) *regexp.Regexp {
 // still need the pre-strip data. A nil/empty rawSchema or a nil instance
 // are each handled the same way ValidateInstance handles them (parse
 // skipped; nil treated as {}).
-func StripReadOnly(rawSchema json.RawMessage, instance map[string]any) (map[string]any, error) {
+//
+// Returns ErrTooComplex, with instance possibly partially stripped, if the
+// walk exceeds maxStripSteps - see docs/jsonschemautil.md ("Complexity limit").
+func StripReadOnly(rawSchema json.RawMessage, instance map[string]any) (result map[string]any, err error) {
 	if instance == nil {
 		instance = map[string]any{}
 	}
@@ -54,7 +84,19 @@ func StripReadOnly(rawSchema json.RawMessage, instance map[string]any) (map[stri
 		return nil, fmt.Errorf("%w: parse schema: %w", ErrSchemaLoad, err)
 	}
 
-	stripValue(&sch, &sch, instance, patternCache{})
+	w := &stripWalker{root: &sch, cache: patternCache{}, remaining: maxStripSteps}
+	defer func() {
+		r := recover()
+		if r == nil {
+			return
+		}
+		if e, ok := r.(error); ok && errors.Is(e, errStepBudgetExceeded) {
+			result, err = nil, fmt.Errorf("%w: exceeded %d schema-application steps", ErrTooComplex, maxStripSteps)
+			return
+		}
+		panic(r)
+	}()
+	w.stripValue(&sch, instance)
 	return instance, nil
 }
 
@@ -62,18 +104,18 @@ func StripReadOnly(rawSchema json.RawMessage, instance map[string]any) (map[stri
 // schema is marked readOnly, then recurses into the surviving values with
 // every applicable schema, so a nested readOnly field declared by any of
 // them is stripped.
-func stripObject(root, sch *jsonschema.Schema, obj map[string]any, cache patternCache) {
+func (w *stripWalker) stripObject(sch *jsonschema.Schema, obj map[string]any) {
 	if sch == nil || obj == nil {
 		return
 	}
 	for name, value := range obj {
-		propSchemas := propertySchemas(sch, name, cache)
-		if slices.ContainsFunc(propSchemas, func(s *jsonschema.Schema) bool { return isReadOnly(root, s) }) {
+		propSchemas := propertySchemas(sch, name, w.cache)
+		if slices.ContainsFunc(propSchemas, w.isReadOnly) {
 			delete(obj, name)
 			continue
 		}
 		for _, propSchema := range propSchemas {
-			stripValue(root, propSchema, value, cache)
+			w.stripValue(propSchema, value)
 		}
 	}
 }
@@ -81,14 +123,14 @@ func stripObject(root, sch *jsonschema.Schema, obj map[string]any, cache pattern
 // isReadOnly reports whether sch is readOnly, checking both the schema
 // itself and, if present, what its "$ref" resolves to - a "readOnly"
 // sibling of "$ref" and one declared on the ref target are both honored.
-func isReadOnly(root, sch *jsonschema.Schema) bool {
+func (w *stripWalker) isReadOnly(sch *jsonschema.Schema) bool {
 	if sch == nil {
 		return false
 	}
 	if sch.ReadOnly {
 		return true
 	}
-	resolved := resolveRef(root, sch)
+	resolved := w.resolveRef(sch)
 	return resolved != nil && resolved.ReadOnly
 }
 
@@ -129,29 +171,30 @@ func propertySchemas(sch *jsonschema.Schema, name string, cache patternCache) []
 // stripValue recurses into value if it's a JSON object or array and sch
 // describes its shape; anything else (scalars, or no schema to recurse
 // with) is left as-is.
-func stripValue(root, sch *jsonschema.Schema, value any, cache patternCache) {
+func (w *stripWalker) stripValue(sch *jsonschema.Schema, value any) {
 	if sch == nil {
 		return
 	}
-	stripShape(root, sch, value, cache)
+	w.step()
+	w.stripShape(sch, value)
 	if sch.Ref != "" {
-		if target := resolveRef(root, sch); target != nil {
-			stripShape(root, target, value, cache)
+		if target := w.resolveRef(sch); target != nil {
+			w.stripShape(target, value)
 		}
 	}
 }
 
-func stripShape(root, sch *jsonschema.Schema, value any, cache patternCache) {
+func (w *stripWalker) stripShape(sch *jsonschema.Schema, value any) {
 	switch v := value.(type) {
 	case map[string]any:
-		stripObject(root, sch, v, cache)
+		w.stripObject(sch, v)
 	case []any:
 		for i, item := range v {
 			itemSch := itemSchema(sch, i)
 			if itemSch == nil {
 				continue
 			}
-			stripValue(root, itemSch, item, cache)
+			w.stripValue(itemSch, item)
 		}
 	}
 }
@@ -175,18 +218,18 @@ func itemSchema(sch *jsonschema.Schema, index int) *jsonschema.Schema {
 }
 
 // resolveRef follows a direct "#/$defs/<name>" or "#/definitions/<name>"
-// $ref against root, one level; anything else is left unresolved (nil) -
+// $ref against w.root, one level; anything else is left unresolved (nil) -
 // see docs/jsonschemautil.md for what's supported.
-func resolveRef(root, sch *jsonschema.Schema) *jsonschema.Schema {
+func (w *stripWalker) resolveRef(sch *jsonschema.Schema) *jsonschema.Schema {
 	if sch == nil || sch.Ref == "" {
 		return sch
 	}
 	name, ok := strings.CutPrefix(sch.Ref, "#/$defs/")
 	if ok {
-		return root.Defs[unescapeJSONPointerToken(name)]
+		return w.root.Defs[unescapeJSONPointerToken(name)]
 	}
 	if name, ok := strings.CutPrefix(sch.Ref, "#/definitions/"); ok {
-		return root.Definitions[unescapeJSONPointerToken(name)]
+		return w.root.Definitions[unescapeJSONPointerToken(name)]
 	}
 	return nil
 }

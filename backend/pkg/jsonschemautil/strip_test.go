@@ -1,8 +1,11 @@
 package jsonschemautil
 
 import (
+	"encoding/json"
 	"errors"
+	"strings"
 	"testing"
+	"time"
 )
 
 func TestStripReadOnly_NoSchemaIsNoop(t *testing.T) {
@@ -640,5 +643,49 @@ func TestStripReadOnly_MutatesInputInPlace(t *testing.T) {
 	got["addedAfter"] = true
 	if instance["addedAfter"] != true {
 		t.Error("StripReadOnly() return value is not the same underlying map as the input")
+	}
+}
+
+// A self-referential schema where more than one property schema applies to
+// the same key (two overlapping patternProperties entries) turns a modestly
+// deep instance into an exponential number of stripValue calls - see
+// maxStripSteps. Without a budget this either hangs or takes an
+// impractically long time; with it, StripReadOnly must fail fast instead.
+func TestStripReadOnly_ExponentialBlowupIsBounded(t *testing.T) {
+	schema := []byte(`{
+		"type": "object",
+		"$defs": {
+			"Node": {
+				"type": "object",
+				"patternProperties": {
+					"^x$": {"$ref": "#/$defs/Node"},
+					"x": {"$ref": "#/$defs/Node"}
+				}
+			}
+		},
+		"properties": {
+			"root": {"$ref": "#/$defs/Node"}
+		}
+	}`)
+
+	const depth = 30 // 2^30 stripValue calls if unbounded; budget must cut this off long before that
+	js := `{"root":` + strings.Repeat(`{"x":`, depth) + `{}` + strings.Repeat("}", depth) + `}`
+	var instance map[string]any
+	if err := json.Unmarshal([]byte(js), &instance); err != nil {
+		t.Fatalf("test setup: unmarshal instance: %v", err)
+	}
+
+	start := time.Now()
+	got, err := StripReadOnly(schema, instance)
+	elapsed := time.Since(start)
+
+	if !errors.Is(err, ErrTooComplex) {
+		t.Fatalf("StripReadOnly() error = %v, want ErrTooComplex", err)
+	}
+	if got != nil {
+		t.Errorf("StripReadOnly() = %v, want nil on ErrTooComplex", got)
+	}
+	if elapsed > 5*time.Second {
+		t.Errorf("StripReadOnly() took %v to fail, want the step budget to cut it off quickly", elapsed)
 	}
 }
